@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+PID_FILE="$SCRIPT_DIR/znode.pid"
+AGG_PID_FILE="$SCRIPT_DIR/cluster-aggregator.pid"
+P2P_SOCKET="/tmp/znode-p2p.sock"
+SERVICE_NAME="znode.service"
+
+# Stop p2p-daemon if running
+stop_p2p_daemon() {
+  local daemon_pids=$(pgrep -f "p2p-daemon.*--socket" 2>/dev/null || true)
+  if [ -n "$daemon_pids" ]; then
+    echo "[stop] Stopping p2p-daemon..."
+    for pid in $daemon_pids; do
+      kill "$pid" 2>/dev/null || true
+    done
+    sleep 1
+    for pid in $daemon_pids; do
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+      fi
+    done
+  fi
+  
+  if [ -e "$P2P_SOCKET" ]; then
+    rm -f "$P2P_SOCKET"
+  fi
+}
+
+stop_cluster_aggregator() {
+  if [ -f "$AGG_PID_FILE" ]; then
+    local AGG_PID
+    AGG_PID="$(cat "$AGG_PID_FILE" 2>/dev/null || true)"
+    if [ -n "$AGG_PID" ] && kill -0 "$AGG_PID" 2>/dev/null; then
+      echo "[stop] Stopping cluster-aggregator (PID $AGG_PID)..."
+      kill "$AGG_PID" 2>/dev/null || true
+      sleep 1
+      if kill -0 "$AGG_PID" 2>/dev/null; then
+        kill -9 "$AGG_PID" 2>/dev/null || true
+      fi
+    fi
+    rm -f "$AGG_PID_FILE" 2>/dev/null || true
+  fi
+
+  local agg_pids
+  agg_pids="$(pgrep -f 'cluster-aggregator.js' 2>/dev/null || true)"
+  if [ -n "$agg_pids" ]; then
+    echo "[stop] Stopping stray cluster-aggregator processes..."
+    for pid in $agg_pids; do
+      kill "$pid" 2>/dev/null || true
+    done
+  fi
+}
+
+stop_monero_rpc() {
+  local root="$SCRIPT_DIR"
+  local pid_file_rpc="${MONERO_RPC_PID_FILE:-$root/monero-rpc.pid}"
+  if [ -f "$pid_file_rpc" ]; then
+    local pid
+    pid="$(cat "$pid_file_rpc" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      echo "[stop] Stopping monero-wallet-rpc (PID $pid)..."
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+      fi
+    fi
+    rm -f "$pid_file_rpc" 2>/dev/null || true
+  fi
+  local port="${MONERO_RPC_PORT:-18083}"
+  local pids=""
+  if command -v ss >/dev/null 2>&1; then
+    pids=$(ss -ltnp 2>/dev/null | awk -v p=":"$port"" '/monero-wallet-rpc/ && $4 ~ p { match($0, /pid=([0-9]+)/, m); if (m[1] != "") print m[1]; }' | sort -u)
+  elif command -v netstat >/dev/null 2>&1; then
+    pids=$(netstat -ltnp 2>/dev/null | awk -v p=":"$port"" '$4 ~ p { n = split($7, a, "/"); if (n > 1 && a[2] == "monero-wallet-rpc") print a[1]; }' | sort -u)
+  fi
+  if [ -n "$pids" ]; then
+    echo "[stop] Stopping stray monero-wallet-rpc on port $port (PIDs: $pids)..."
+    for pid in $pids; do
+      kill "$pid" 2>/dev/null || true
+    done
+    sleep 1
+    for pid in $pids; do
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+      fi
+    done
+  fi
+}
+
+
+# Check if systemd service exists and is running
+if [ -f "/etc/systemd/system/$SERVICE_NAME" ]; then
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    echo "[stop] Stopping znode via systemd..."
+    systemctl stop "$SERVICE_NAME"
+    
+    # Wait for service to stop
+    for i in $(seq 1 30); do
+      if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+        echo "[stop] znode stopped."
+        stop_p2p_daemon
+        stop_cluster_aggregator
+        stop_monero_rpc
+        rm -f "$PID_FILE" 2>/dev/null || true
+        exit 0
+      fi
+      sleep 1
+    done
+    
+    echo "[stop] Service did not stop in 30s, forcing..."
+    systemctl kill "$SERVICE_NAME" 2>/dev/null || true
+    stop_p2p_daemon
+        stop_cluster_aggregator
+        stop_monero_rpc
+    rm -f "$PID_FILE" 2>/dev/null || true
+    echo "[stop] znode forcibly stopped."
+    exit 0
+  else
+    echo "[stop] znode is not running (systemd service inactive)."
+    stop_p2p_daemon
+        stop_cluster_aggregator
+        stop_monero_rpc
+    rm -f "$PID_FILE" 2>/dev/null || true
+    exit 0
+  fi
+fi
+
+# Fallback to legacy stop if no systemd service
+echo "[stop] No systemd service found, using legacy shutdown..."
+
+if [ ! -f "$PID_FILE" ]; then
+  echo "[stop] No pidfile found ($PID_FILE). Is znode running?"
+  stop_p2p_daemon
+        stop_cluster_aggregator
+        stop_monero_rpc
+  exit 0
+fi
+
+PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+if [ -z "$PID" ]; then
+  echo "[stop] Empty pidfile, removing."
+  rm -f "$PID_FILE"
+  stop_p2p_daemon
+        stop_cluster_aggregator
+        stop_monero_rpc
+  exit 0
+fi
+
+if ! kill -0 "$PID" 2>/dev/null; then
+  echo "[stop] No process with PID $PID, removing stale pidfile."
+  rm -f "$PID_FILE"
+  stop_p2p_daemon
+        stop_cluster_aggregator
+        stop_monero_rpc
+  exit 0
+fi
+
+echo "[stop] Stopping znode (PID $PID)..."
+kill "$PID" || true
+
+# Wait up to 30s for clean shutdown
+for i in $(seq 1 30); do
+  if ! kill -0 "$PID" 2>/dev/null; then
+    echo "[stop] znode stopped."
+    rm -f "$PID_FILE"
+    stop_p2p_daemon
+        stop_cluster_aggregator
+        stop_monero_rpc
+    exit 0
+  fi
+  sleep 1
+done
+
+echo "[stop] Process did not exit after 30s, sending SIGKILL."
+kill -9 "$PID" 2>/dev/null || true
+rm -f "$PID_FILE"
+stop_p2p_daemon
+        stop_cluster_aggregator
+        stop_monero_rpc
+echo "[stop] znode forcibly stopped."
